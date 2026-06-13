@@ -1,4 +1,6 @@
 // This plugin is a direct port of https://github.com/IanVS/vite-plugin-turbosnap
+import { createHash } from 'node:crypto';
+import { homedir } from 'node:os';
 import { relative } from 'node:path';
 
 import type { BuilderStats } from 'storybook/internal/types';
@@ -7,11 +9,7 @@ import type { BuilderStats } from 'storybook/internal/types';
 import slash from 'slash';
 import type { Plugin } from 'vite';
 
-import {
-  SB_VIRTUAL_FILES,
-  getOriginalVirtualModuleId,
-  getResolvedVirtualModuleId,
-} from '../virtual-file-names.ts';
+import { SB_VIRTUAL_FILES, getOriginalVirtualModuleId } from '../virtual-file-names.ts';
 
 /*
  * Reason, Module are copied from chromatic types
@@ -25,6 +23,12 @@ interface Module {
   name: string;
   modules?: Array<Pick<Module, 'name'>>;
   reasons?: Reason[];
+  /**
+   * Stable hash of this module's normalized, post-transform content. Lets hash-based TurboSnap
+   * reduce a story to a single hash by rolling up the hashes of its reachable modules, instead of
+   * git-diffing. Absent for modules with no code (e.g. unresolved externals).
+   */
+  contentHash?: string;
 }
 
 type WebpackStatsPluginOptions = {
@@ -39,8 +43,14 @@ function stripQueryParams(filePath: string): string {
   return filePath.split('?')[0];
 }
 
-/** We only care about user code, not node_modules, vite files, or (most) virtual files. */
-function isUserCode(moduleName: string) {
+/**
+ * Modules we keep as nodes in the emitted graph: user code, node_modules, and Storybook's own
+ * virtual entry files. Vite/Rollup infrastructure and internal `\0`-prefixed virtual modules are
+ * not kept — but the graph is bridged *through* them (see {@link resolveKeptImports}) so the real
+ * modules they connect (notably `.storybook/preview.*` via the project-annotations virtual) are not
+ * orphaned out of the graph.
+ */
+function isKept(moduleName: string) {
   if (!moduleName) {
     return false;
   }
@@ -60,6 +70,9 @@ function isUserCode(moduleName: string) {
 export type WebpackStatsPlugin = Plugin & { storybookGetStats: () => BuilderStats };
 
 export function pluginWebpackStats({ workingDir }: WebpackStatsPluginOptions): WebpackStatsPlugin {
+  const workingDirSlash = slash(workingDir);
+  const homeDirSlash = slash(homedir());
+
   /** Convert an absolute path name to a path relative to the vite root, with a starting `./` */
   function normalize(filename: string) {
     // Do not try to resolve virtual files
@@ -90,18 +103,26 @@ export function pluginWebpackStats({ workingDir }: WebpackStatsPluginOptions): W
     }
   }
 
-  /** Helper to create Reason objects out of a list of string paths */
-  function createReasons(importers?: readonly string[]): Reason[] {
-    return (importers || []).map((i) => ({ moduleName: normalize(i) }));
+  /**
+   * Normalize a module's transformed code before hashing so the hash is deterministic across
+   * machines/CI: drop sourcemap references (their paths/contents are environment-specific) and
+   * rewrite absolute project/home paths to stable placeholders.
+   */
+  function normalizeCode(code: string) {
+    return slash(code)
+      .replace(/\n?\/\/# sourceMappingURL=.*$/gm, '')
+      .replace(/\/\*# sourceMappingURL=[\s\S]*?\*\//g, '')
+      .split(workingDirSlash)
+      .join('.')
+      .split(homeDirSlash)
+      .join('~');
   }
 
-  /** Helper function to build a `Module` given a filename and list of files that import it */
-  function createStatsMapModule(filename: string, importers?: readonly string[]): Module {
-    return {
-      id: filename,
-      name: filename,
-      reasons: createReasons(importers),
-    };
+  function hashCode(code: string | null | undefined): string | undefined {
+    if (code == null) {
+      return undefined;
+    }
+    return createHash('sha256').update(normalizeCode(code)).digest('hex').slice(0, 16);
   }
 
   const statsMap = new Map<string, Module>();
@@ -110,28 +131,75 @@ export function pluginWebpackStats({ workingDir }: WebpackStatsPluginOptions): W
     name: 'storybook:rollup-plugin-webpack-stats',
     // We want this to run after the vite build plugins (https://vitejs.dev/guide/api-plugin.html#plugin-ordering)
     enforce: 'post',
-    moduleParsed: function (mod) {
-      if (!isUserCode(mod.id)) {
-        return;
+    // Build the graph from Rollup's complete module info at the end of the build, rather than
+    // incrementally in `moduleParsed`. This lets us bridge *through* the internal virtual modules
+    // that Storybook wires the preview config through, so `.storybook/preview.*` and addon preview
+    // entries are no longer orphaned out of the Vite graph (the "preview gap").
+    buildEnd() {
+      const importsOf = (id: string): readonly string[] => {
+        const info = this.getModuleInfo(id);
+        if (!info) {
+          return [];
+        }
+        return info.importedIds.concat(info.dynamicallyImportedIds);
+      };
+
+      /**
+       * The kept modules that `id` really imports, bridging through any non-kept modules in
+       * between (e.g. connecting a virtual module's real importers to its real imports).
+       */
+      const resolveKeptImports = (id: string): string[] => {
+        const result = new Set<string>();
+        const visited = new Set<string>();
+        const stack = [...importsOf(id)];
+        while (stack.length > 0) {
+          const dep = stack.pop()!;
+          if (visited.has(dep)) {
+            continue;
+          }
+          visited.add(dep);
+          if (isKept(dep)) {
+            result.add(dep);
+          } else {
+            stack.push(...importsOf(dep));
+          }
+        }
+        return [...result];
+      };
+
+      const ensureModule = (rawId: string): Module => {
+        const name = normalize(rawId);
+        let mod = statsMap.get(name);
+        if (!mod) {
+          mod = {
+            id: name,
+            name,
+            reasons: [],
+            contentHash: hashCode(this.getModuleInfo(rawId)?.code),
+          };
+          statsMap.set(name, mod);
+        }
+        return mod;
+      };
+
+      const addReason = (target: Module, importerName: string) => {
+        if (importerName === target.name) {
+          return;
+        }
+        if (!target.reasons!.some((r) => r.moduleName === importerName)) {
+          target.reasons!.push({ moduleName: importerName });
+        }
+      };
+
+      for (const id of this.getModuleIds()) {
+        if (!isKept(id)) {
+          continue;
+        }
+        const importer = ensureModule(id);
+        for (const depId of resolveKeptImports(id)) {
+          addReason(ensureModule(depId), importer.name);
+        }
       }
-      mod.importedIds
-        .concat(mod.dynamicallyImportedIds)
-        .filter((name) => isUserCode(name))
-        .forEach((depIdUnsafe) => {
-          const depId = normalize(depIdUnsafe);
-          if (!statsMap.has(depId)) {
-            statsMap.set(depId, createStatsMapModule(depId, [mod.id]));
-            return;
-          }
-          const m = statsMap.get(depId);
-          if (!m) {
-            return;
-          }
-          m.reasons = (m.reasons ?? [])
-            .concat(createReasons([mod.id]))
-            .filter((r) => r.moduleName !== depId);
-          statsMap.set(depId, m);
-        });
     },
 
     storybookGetStats() {

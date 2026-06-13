@@ -3,6 +3,9 @@ export { storybookOptimizeDepsPlugin } from './storybook-optimize-deps-plugin.ts
 export { storybookEntryPlugin } from './storybook-entry-plugin.ts';
 export { pluginWebpackStats } from './webpack-stats-plugin.ts';
 export type { WebpackStatsPlugin } from './webpack-stats-plugin.ts';
+// PROTOTYPE: chunk-level TurboSnap signal (opt-in via STORYBOOK_CHUNK_GRAPH), for comparison
+// against the module-level contentHash graph.
+export { pluginChunkStats } from './chunk-stats-plugin.ts';
 
 // Lower-level plugins re-exported for internal use and tests
 export { injectExportOrderPlugin } from './inject-export-order-plugin.ts';

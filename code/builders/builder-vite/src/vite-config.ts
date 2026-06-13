@@ -13,6 +13,7 @@ import type {
 
 import {
   csfPlugin,
+  pluginChunkStats,
   pluginWebpackStats,
   storybookEntryPlugin,
   storybookExternalGlobalsPlugin,
@@ -94,6 +95,8 @@ export async function pluginConfig(options: Options) {
     ...(await storybookEntryPlugin(options)),
     // Builder-specific: webpack-compatible stats for turbosnap/chromatic
     pluginWebpackStats({ workingDir: process.cwd() }),
+    // PROTOTYPE: chunk-level signal, emitted only when STORYBOOK_CHUNK_GRAPH is set
+    pluginChunkStats({ workingDir: process.cwd() }),
   ] as PluginOption[];
 
   return plugins;

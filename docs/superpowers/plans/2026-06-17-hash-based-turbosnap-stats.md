@@ -517,3 +517,55 @@ git commit -m "chore(builder-vite): remove temporary turbosnap stats logging"
 - **Spec coverage:** #1 (Task 2 Step 5), #2/#3/#10 (Task 2 Step 6), #4 (Task 2 Step 6 pattern on `tasks/auth.ts`), #5/#6/#7 (Task 3 Steps 6–7), #8/#9 (story set-diff — verified via the CLI compare in Task 4; module appears/disappears in the graph), #11 (Task 4 Step 2). Normalization rules → Task 2 Step 2. Connectivity → Task 3. CLI rollup model → documented in the spec, exercised in Task 4.
 - **Watch-item (CLI-side):** keeping `project-annotations` as a node makes it (and `setup-addons`) match the CLI's `csfGlob` heuristic (reasons include the entry). These are constant across builds and benign for added/removed, but if Task 4 shows miscounts, the fix is excluding virtual modules from `csfGlobs` in the CLI — not the plugin.
 - **#11 keying:** holds only if the CLI rollup keys on the multiset of `contentHash`es, not `name:hash` pairs (paths in `name` are not machine-stable for global-cache deps).
+
+---
+
+## Validation results (2026-06-17)
+
+**Setup.** Validated against the `chromatic-cli` repo (`@storybook/html-vite`, 115 story files /
+342 stories). The locally-built `@storybook/builder-vite` was linked into the CLI by replacing
+`node_modules/@storybook/builder-vite` with a symlink to the monorepo package, then running
+`yarn build-storybook` and inspecting `storybook-static/preview-stats.json`. The changed/added/removed
+counts were computed with a standalone harness implementing the spec's CLI-side rollup model (the CLI
+itself does not yet ship hash-based comparison): story files = modules imported by the stories entry;
+preview subgraph = modules reachable from the project-annotations virtual module; per-story rollup =
+sha256 over the sorted multiset of reachable modules' `contentHash`es (keyed on content, not paths);
+globalize-on-preview-change → all stories.
+
+**Gate findings.**
+
+- _Connectivity (old plugin)._ Baseline with published `@storybook/builder-vite` confirmed the gap:
+  `project-annotations` was absent (dropped as a `\0` virtual), and `.storybook/preview.ts` appeared
+  only as a `reason` with no node of its own, so the preview branch never chained to `vite-app.js`.
+  After Task 3 the chain is connected: `./iframe.html → vite-app.js → project-annotations.js →
+  ./.storybook/preview.ts → ./node_modules/ansi-html/index.js`.
+- _Transformed code._ `ModuleInfo.code` for `.ts` modules is comment-free (esbuild strips them), but
+  the CommonJS→ESM wrapper for plain-JS node_modules deps (e.g. `ansi-html`) keeps source comments
+  verbatim. The ESM facade also embeds an absolute `workingDir` path in an import specifier, confirming
+  the path-rewrite step is load-bearing. This drove two normalization fixes beyond the original spec:
+  comment stripping in `normalizeCode` (literals preserved) and whitespace collapse (so the blank line
+  left by a removed comment does not change the hash).
+- _Naming._ The project-annotations resolved id (`\0virtual:…`) was not handled by `normalize()` and
+  produced a name with an embedded null byte; it is now normalized like the other virtual files.
+
+**Scenario table (observed = expected).**
+
+| #  | Scenario                                    | changed | added | removed |
+|----|---------------------------------------------|:------:|:----:|:------:|
+| 1  | rebuild, no edit (determinism)              | 0      | 0    | 0      |
+| 2  | story file — substantive (`auth.stories.ts`)| 3      | 0    | 0      |
+| 3  | story file — comment-only                   | 0      | 0    | 0      |
+| 4  | used dependency — code change (`tasks/auth.ts`)| 3   | 0    | 0      |
+| 5  | preview config (`.storybook/preview.ts`)    | 115    | 0    | 0      |
+| 6  | preview dependency — substantive (`ansi-html`)| 115  | 0    | 0      |
+| 7  | preview dependency — comment-only (`ansi-html`)| 0   | 0    | 0      |
+| 8  | add 1 story (`components/extra.stories.ts`) | 0      | 1    | 0      |
+| 9  | remove 1 story (`components/link.stories.ts`)| 0     | 0    | 1      |
+| 10 | `README.md` (out of graph)                  | 0      | 0    | 0      |
+| 11 | dependency paths relocated, content identical| 0     | 0    | 0      |
+
+All 11 rows match. #2/#4 yield 3 because `auth.stories.ts` (and `tasks/auth.ts`, which it imports) is
+re-imported by `workflows/uploadBuild.stories.ts` and `workflows/uploadBuildE2E.stories.ts`, so three
+story files roll up the changed hash. #11 was simulated by relocating every `./node_modules/` path to a
+`./.yarn/global-cache/` path with identical content (155 modules); the content-keyed rollup reports
+0/0/0.

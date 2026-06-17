@@ -125,6 +125,19 @@ describe('pluginWebpackStats', () => {
     expect(hashOf(differentContent)).not.toBe(hashOf(first));
   });
 
+  it('hashes CRLF and LF line endings identically (cross-platform determinism)', () => {
+    // A Windows checkout (CRLF) must produce the same per-module hash as a Linux/CI one (LF),
+    // otherwise every story would re-capture purely from the line-ending difference.
+    const lf = runPlugin({ '/project/src/a.ts': { code: 'const a = 1;\nconst b = 2;\n' } });
+    const crlf = runPlugin({ '/project/src/a.ts': { code: 'const a = 1;\r\nconst b = 2;\r\n' } });
+
+    const hashOf = (stats: ReturnType<typeof runPlugin>) =>
+      stats.modules.find((m) => m.name === './src/a.ts')?.contentHash;
+
+    expect(hashOf(lf)).toBeDefined();
+    expect(hashOf(crlf)).toBe(hashOf(lf));
+  });
+
   it('omits the content hash for modules without code', () => {
     const { modules } = runPlugin({ '/project/src/external-ish.ts': { code: null } });
     const mod = modules.find((m) => m.name === './src/external-ish.ts');

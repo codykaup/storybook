@@ -105,11 +105,13 @@ export function pluginWebpackStats({ workingDir }: WebpackStatsPluginOptions): W
 
   /**
    * Normalize a module's transformed code before hashing so the hash is deterministic across
-   * machines/CI: drop sourcemap references (their paths/contents are environment-specific) and
-   * rewrite absolute project/home paths to stable placeholders.
+   * machines/CI: normalize line endings (a Windows CRLF checkout must hash the same as a Linux LF
+   * one), drop sourcemap references (their paths/contents are environment-specific), and rewrite
+   * absolute project/home paths to stable placeholders.
    */
   function normalizeCode(code: string) {
     return slash(code)
+      .replace(/\r\n/g, '\n')
       .replace(/\n?\/\/# sourceMappingURL=.*$/gm, '')
       .replace(/\/\*# sourceMappingURL=[\s\S]*?\*\//g, '')
       .split(workingDirSlash)

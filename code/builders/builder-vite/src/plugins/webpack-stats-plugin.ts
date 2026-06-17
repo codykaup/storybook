@@ -14,6 +14,7 @@ import {
   getOriginalVirtualModuleId,
   getResolvedVirtualModuleId,
 } from '../virtual-file-names.ts';
+import { VIRTUAL_ID as PROJECT_ANNOTATIONS_VIRTUAL_ID } from './storybook-project-annotations-plugin.ts';
 
 /*
  * Reason, Module are copied from chromatic types
@@ -47,14 +48,26 @@ function stripQueryParams(filePath: string): string {
   return filePath.split('?')[0];
 }
 
-/** We only care about user code, not node_modules, vite files, or (most) virtual files. */
-function isUserCode(moduleName: string) {
+/**
+ * Modules we keep as nodes in the emitted graph: user code, node_modules, and Storybook's own
+ * virtual entry + project-annotations files. Vite/Rollup infrastructure and other internal
+ * `\0`-prefixed virtual modules are bridged *through* (see resolveKeptImports), not kept, so the
+ * real modules they connect are not orphaned.
+ */
+function isKept(moduleName: string) {
   if (!moduleName) {
     return false;
   }
 
+  const original = getOriginalVirtualModuleId(moduleName);
+
   // keep Storybook's virtual files because they import the story files, so they are essential to the module graph
-  if (Object.values(SB_VIRTUAL_FILES).includes(getOriginalVirtualModuleId(moduleName))) {
+  if (Object.values(SB_VIRTUAL_FILES).includes(original)) {
+    return true;
+  }
+
+  // Keep the project-annotations bridge so preview.* and its deps connect to the entry.
+  if (original === PROJECT_ANNOTATIONS_VIRTUAL_ID) {
     return true;
   }
 
@@ -161,15 +174,35 @@ export function pluginWebpackStats({ workingDir }: WebpackStatsPluginOptions): W
         }
       };
 
+      /**
+       * The kept modules that `id` really imports, bridging through any non-kept modules in between
+       * (e.g. connecting the project-annotations virtual module's real imports to their importers).
+       */
+      const resolveKeptImports = (id: string): string[] => {
+        const result = new Set<string>();
+        const visited = new Set<string>();
+        const stack = [...importsOf(id)];
+        while (stack.length > 0) {
+          const dep = stack.pop()!;
+          if (visited.has(dep)) {
+            continue;
+          }
+          visited.add(dep);
+          if (isKept(dep)) {
+            result.add(dep);
+          } else {
+            stack.push(...importsOf(dep));
+          }
+        }
+        return [...result];
+      };
+
       for (const id of this.getModuleIds()) {
-        if (!isUserCode(id)) {
+        if (!isKept(id)) {
           continue;
         }
         const importer = ensureModule(id);
-        for (const depId of importsOf(id)) {
-          if (!isUserCode(depId)) {
-            continue;
-          }
+        for (const depId of resolveKeptImports(id)) {
           addReason(ensureModule(depId), importer.name);
         }
       }

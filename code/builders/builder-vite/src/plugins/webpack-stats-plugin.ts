@@ -1,4 +1,6 @@
 // This plugin is a direct port of https://github.com/IanVS/vite-plugin-turbosnap
+import { createHash } from 'node:crypto';
+import { homedir } from 'node:os';
 import { relative } from 'node:path';
 
 import type { BuilderStats } from 'storybook/internal/types';
@@ -25,6 +27,12 @@ interface Module {
   name: string;
   modules?: Array<Pick<Module, 'name'>>;
   reasons?: Reason[];
+  /**
+   * Stable hash of this module's normalized, post-transform content. Lets hash-based TurboSnap
+   * reduce a story to a single hash by rolling up its reachable modules instead of git-diffing.
+   * Absent for modules with no code (e.g. unresolved externals).
+   */
+  contentHash?: string;
 }
 
 type WebpackStatsPluginOptions = {
@@ -90,18 +98,31 @@ export function pluginWebpackStats({ workingDir }: WebpackStatsPluginOptions): W
     }
   }
 
-  /** Helper to create Reason objects out of a list of string paths */
-  function createReasons(importers?: readonly string[]): Reason[] {
-    return (importers || []).map((i) => ({ moduleName: normalize(i) }));
+  const workingDirSlash = slash(workingDir);
+  const homeDirSlash = slash(homedir());
+
+  /**
+   * Normalize transformed code before hashing so the hash is deterministic across machines/CI:
+   * normalize separators and line endings, drop sourcemap references (environment-specific), and
+   * rewrite absolute project/home paths to stable placeholders. workingDir is rewritten before
+   * homedir because workingDir is nested under homedir.
+   */
+  function normalizeCode(code: string) {
+    return slash(code)
+      .replace(/\r\n/g, '\n')
+      .replace(/\n?\/\/# sourceMappingURL=.*$/gm, '')
+      .replace(/\/\*# sourceMappingURL=[\s\S]*?\*\//g, '')
+      .split(workingDirSlash)
+      .join('.')
+      .split(homeDirSlash)
+      .join('~');
   }
 
-  /** Helper function to build a `Module` given a filename and list of files that import it */
-  function createStatsMapModule(filename: string, importers?: readonly string[]): Module {
-    return {
-      id: filename,
-      name: filename,
-      reasons: createReasons(importers),
-    };
+  function hashContent(code: string | null | undefined): string | undefined {
+    if (code == null) {
+      return undefined;
+    }
+    return createHash('sha256').update(normalizeCode(code)).digest('hex').slice(0, 16);
   }
 
   const statsMap = new Map<string, Module>();
@@ -110,28 +131,48 @@ export function pluginWebpackStats({ workingDir }: WebpackStatsPluginOptions): W
     name: 'storybook:rollup-plugin-webpack-stats',
     // We want this to run after the vite build plugins (https://vitejs.dev/guide/api-plugin.html#plugin-ordering)
     enforce: 'post',
-    moduleParsed: function (mod) {
-      if (!isUserCode(mod.id)) {
-        return;
+    buildEnd() {
+      const importsOf = (id: string): readonly string[] => {
+        const info = this.getModuleInfo(id);
+        return info ? info.importedIds.concat(info.dynamicallyImportedIds) : [];
+      };
+
+      const ensureModule = (rawId: string): Module => {
+        const name = normalize(rawId);
+        let mod = statsMap.get(name);
+        if (!mod) {
+          mod = {
+            id: name,
+            name,
+            reasons: [],
+            contentHash: hashContent(this.getModuleInfo(rawId)?.code),
+          };
+          statsMap.set(name, mod);
+        }
+        return mod;
+      };
+
+      const addReason = (target: Module, importerName: string) => {
+        if (importerName === target.name) {
+          return;
+        }
+        if (!target.reasons!.some((r) => r.moduleName === importerName)) {
+          target.reasons!.push({ moduleName: importerName });
+        }
+      };
+
+      for (const id of this.getModuleIds()) {
+        if (!isUserCode(id)) {
+          continue;
+        }
+        const importer = ensureModule(id);
+        for (const depId of importsOf(id)) {
+          if (!isUserCode(depId)) {
+            continue;
+          }
+          addReason(ensureModule(depId), importer.name);
+        }
       }
-      mod.importedIds
-        .concat(mod.dynamicallyImportedIds)
-        .filter((name) => isUserCode(name))
-        .forEach((depIdUnsafe) => {
-          const depId = normalize(depIdUnsafe);
-          if (!statsMap.has(depId)) {
-            statsMap.set(depId, createStatsMapModule(depId, [mod.id]));
-            return;
-          }
-          const m = statsMap.get(depId);
-          if (!m) {
-            return;
-          }
-          m.reasons = (m.reasons ?? [])
-            .concat(createReasons([mod.id]))
-            .filter((r) => r.moduleName !== depId);
-          statsMap.set(depId, m);
-        });
     },
 
     storybookGetStats() {

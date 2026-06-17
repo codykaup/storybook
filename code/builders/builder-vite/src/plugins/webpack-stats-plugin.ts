@@ -95,12 +95,19 @@ export function pluginWebpackStats({ workingDir }: WebpackStatsPluginOptions): W
     // ! to ensure that the stats file doesn't change between the versions
     // ! Turbosnap is also only compatible with the old virtual file names
     // ! the old virtual file names did not start with the obligatory \0 character
-    if (Object.values(SB_VIRTUAL_FILES).includes(getOriginalVirtualModuleId(filename))) {
+    const original = getOriginalVirtualModuleId(filename);
+    // The project-annotations module is bridged into the graph (see isKept) so the preview subgraph
+    // connects to the entry; normalize its resolved `\0virtual:` id the same way as the other
+    // virtual files so its name is a clean `/virtual:` path rather than carrying the `\0` prefix.
+    if (
+      Object.values(SB_VIRTUAL_FILES).includes(original) ||
+      original === PROJECT_ANNOTATIONS_VIRTUAL_ID
+    ) {
       // We have to append a forward slash because otherwise we break turbosnap.
       // As soon as the chromatic-cli supports `virtual:` id's without a starting forward slash,
       // we can remove adding the forward slash here
       // Reference: https://github.com/chromaui/chromatic-cli/blob/v11.25.2/node-src/lib/getDependentStoryFiles.ts#L53
-      return `/${getOriginalVirtualModuleId(filename)}`;
+      return `/${original}`;
     }
 
     // Otherwise, we need them in the format `./path/to/file.js`.

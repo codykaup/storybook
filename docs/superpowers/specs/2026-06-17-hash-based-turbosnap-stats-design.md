@@ -84,8 +84,16 @@ To make the hash deterministic across machines / CI (#1) and independent of depe
 3. Strip `sourceMappingURL` comments (`//# …` and `/*# … */`) — inline base64 maps can decode to
    absolute `sources[]`; external map references can carry environment-specific paths. Stripping
    removes the map from the hash regardless of whether its paths are relative or absolute.
-4. Rewrite absolute `workingDir` and `homedir` prefixes to stable placeholders — belt-and-suspenders
-   for any absolute path a transform might bake into the body.
+4. Rewrite absolute `workingDir` then `homedir` prefixes to stable placeholders (`.` and `~`).
+   This is load-bearing, not defensive — Storybook's own virtual modules embed absolute paths:
+   - `codegen-importfn-script.ts` emits `import("<workingDir>/…/foo.stories.ts")` targets.
+   - `processPreviewAnnotation` normalizes preview annotations to absolute paths, which
+     `codegen-project-annotations.ts` drops into `import * as … from '<abs>'`. In-project preview
+     lands under `workingDir`; globally-cached or linked addon entries land under `homedir`.
+
+   Order matters: `workingDir` is nested under `homedir`, so rewrite `workingDir` first or its
+   (longer, more specific) prefix will never match after `homedir → ~`. The exact absolute paths
+   present are confirmed by dumping virtual-module `.code` in verification gate #1.
 
 Hash with `sha256`, truncate to 16 hex chars.
 
@@ -115,14 +123,42 @@ Storybook's `\0`-prefixed virtual modules so the preview subgraph is included ra
 - **#11 relocated deps, identical content (=0)** — `contentHash` is path-independent (deps appear as
   source specifiers, not resolved paths; absolute prefixes stripped). See CLI-side requirement below.
 
-## CLI-side requirement for #11
+## CLI-side rollup model
+
+The plugin only emits per-module data; the rollup and comparison live in the CLI. It sorts modules into
+three buckets it already understands (`getDependentStoryFiles.ts`):
+
+1. **Stories** — modules imported by the stories entry (`csfGlobsByName`, via `storiesEntryFiles`).
+2. **Global config** — `.storybook/` files (`isStorybookFile`); a change triggers a full rebuild
+   (`shouldBail`). This is already how #5 (`preview.ts`) produces 115 in git mode.
+3. **Everything else** — traced up to stories via `reasons`.
+
+Hash mode swaps the changed-input from git diff to `contentHash` diff and computes:
+
+- **changed** = per-story rolled-up hash (each story's own downward-reachable deps) diffed across builds —
+  excludes the entry and the global subgraph.
+- **all stories (115)** = any module in the **preview subgraph** changed → globalize (hash-mode
+  equivalent of bail).
+- **added / removed** = set-diff of the story (`csfGlob`) set, independent of hashes.
+
+**"Global" must be scoped to the preview subgraph, never "reachable from the entry."** The stories-list
+virtual module is the *entry*, not a story dependency, so its hash changing on add/remove is inert for
+"changed" — otherwise #8/#9 would report 115. This falls out naturally because stories don't import the
+entry.
+
+**`ansi-html` (#6) is the reason the connectivity gate is non-optional.** It is a *preview-only* dep — a
+sibling of stories, not an ancestor — so tracing it upward never reaches a story and it would yield 0,
+not 115. The CLI can only globalize it if the plugin's emitted graph connects
+`project-annotations → preview → … → ansi-html`. That connection is verification gate #2.
+
+### #11 keying requirement
 
 Because the plugin keeps `name`/`id` untouched for back-compat, those still contain machine-specific
 paths for dependencies resolved from a **global cache** (e.g. `../../.yarn/cache/ansi-html…`). Content
-hashes match across machines, but #11 holds only if the **CLI's per-story rollup keys on the multiset of
+hashes match across machines, but #11 holds only if the **per-story rollup keys on the multiset of
 `contentHash`es (content), not on `name:hash` pairs**. If names were mixed into the rollup, relocated
-deps would diff despite identical content. This is owned by the CLI; noted here so the rollup is
-implemented accordingly.
+deps would diff despite identical content. Owned by the CLI; noted so the rollup is implemented
+accordingly.
 
 ## Verification gates (run before finalizing implementation)
 

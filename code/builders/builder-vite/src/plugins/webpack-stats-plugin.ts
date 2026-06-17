@@ -122,16 +122,26 @@ export function pluginWebpackStats({ workingDir }: WebpackStatsPluginOptions): W
   const homeDirSlash = slash(homedir());
 
   /**
-   * Normalize transformed code before hashing so the hash is deterministic across machines/CI:
-   * normalize separators and line endings, drop sourcemap references (environment-specific), and
-   * rewrite absolute project/home paths to stable placeholders. workingDir is rewritten before
-   * homedir because workingDir is nested under homedir.
+   * Normalize transformed code before hashing so the hash is deterministic across machines/CI and
+   * insensitive to comment-only edits: normalize separators, strip comments (string/template
+   * literals are preserved), collapse whitespace, and rewrite absolute project/home paths to stable
+   * placeholders. workingDir is rewritten before homedir because workingDir is nested under homedir.
+   *
+   * Comment stripping is necessary because the transform does not strip comments on every loader
+   * path: the CommonJS->ESM wrapper for plain-JS node_modules deps keeps source comments verbatim.
+   * It also subsumes sourcemap reference comments, whose paths are environment-specific. Whitespace
+   * is then collapsed to a single space so the blank lines left behind by removed comments (and
+   * CRLF/formatting differences) do not affect the hash, while token boundaries are preserved so
+   * substantive code changes still produce a different hash.
    */
   function normalizeCode(code: string) {
     return slash(code)
-      .replace(/\r\n/g, '\n')
-      .replace(/\n?\/\/# sourceMappingURL=.*$/gm, '')
-      .replace(/\/\*# sourceMappingURL=[\s\S]*?\*\//g, '')
+      .replace(
+        /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|\/\/[^\n]*|\/\*[\s\S]*?\*\//g,
+        (match, literal) => literal ?? ''
+      )
+      .replace(/\s+/g, ' ')
+      .trim()
       .split(workingDirSlash)
       .join('.')
       .split(homeDirSlash)

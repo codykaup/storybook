@@ -7,11 +7,7 @@ import type { BuilderStats } from 'storybook/internal/types';
 import slash from 'slash';
 import type { Plugin } from 'vite';
 
-import {
-  SB_VIRTUAL_FILES,
-  getOriginalVirtualModuleId,
-  getResolvedVirtualModuleId,
-} from '../virtual-file-names.ts';
+import { SB_VIRTUAL_FILES, getOriginalVirtualModuleId } from '../virtual-file-names.ts';
 
 /*
  * Reason, Module are copied from chromatic types
@@ -39,22 +35,33 @@ function stripQueryParams(filePath: string): string {
   return filePath.split('?')[0];
 }
 
+const COMMONJS_PROXY_SUFFIX = '?commonjs-es-import';
+
+/**
+ * Vite's CommonJS interop wraps each CJS import in a synthetic `\0<id>?commonjs-es-import`
+ * proxy module that re-exports the real module. Follow the proxy to the real id so edges into
+ * node_modules (e.g. react, react-dom) are recorded instead of dropped by the `\0` filter.
+ */
+function unwrapCommonjsProxy(id: string): string {
+  if (id.startsWith('\0') && id.endsWith(COMMONJS_PROXY_SUFFIX)) {
+    return id.slice(1, -COMMONJS_PROXY_SUFFIX.length);
+  }
+  return id;
+}
+
 /** We only care about user code and the node_modules it depends on. Not vite files, or (most) virtual files. */
 function isUserCode(moduleName: string) {
   if (!moduleName) {
     return false;
   }
 
-  // keep Storybook's virtual files because they import the story files, so they are essential to the module graph
-  if (Object.values(SB_VIRTUAL_FILES).includes(getOriginalVirtualModuleId(moduleName))) {
+  // keep Storybook/framework virtual files (e.g. story files and project-annotations, which
+  // imports the framework preview entry) because they are essential to the module graph
+  if (moduleName.startsWith('virtual:') || moduleName.startsWith('\0virtual:')) {
     return true;
   }
 
-  return Boolean(
-    !moduleName.startsWith('vite/') &&
-    !moduleName.startsWith('\0') &&
-    moduleName !== 'react/jsx-runtime'
-  );
+  return Boolean(!moduleName.startsWith('vite/') && !moduleName.startsWith('\0'));
 }
 
 export type WebpackStatsPlugin = Plugin & { storybookGetStats: () => BuilderStats };
@@ -74,7 +81,10 @@ export function pluginWebpackStats({ workingDir }: WebpackStatsPluginOptions): W
     // ! to ensure that the stats file doesn't change between the versions
     // ! Turbosnap is also only compatible with the old virtual file names
     // ! the old virtual file names did not start with the obligatory \0 character
-    if (Object.values(SB_VIRTUAL_FILES).includes(getOriginalVirtualModuleId(filename))) {
+    if (
+      Object.values(SB_VIRTUAL_FILES).includes(getOriginalVirtualModuleId(filename)) ||
+      getOriginalVirtualModuleId(filename).startsWith('virtual:')
+    ) {
       // We have to append a forward slash because otherwise we break turbosnap.
       // As soon as the chromatic-cli supports `virtual:` id's without a starting forward slash,
       // we can remove adding the forward slash here
@@ -116,6 +126,7 @@ export function pluginWebpackStats({ workingDir }: WebpackStatsPluginOptions): W
       }
       mod.importedIds
         .concat(mod.dynamicallyImportedIds)
+        .map(unwrapCommonjsProxy)
         .filter((name) => isUserCode(name))
         .forEach((depIdUnsafe) => {
           const depId = normalize(depIdUnsafe);
